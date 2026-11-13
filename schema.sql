@@ -1,5 +1,5 @@
 -- Aatmabal schema (PostgreSQL / Neon). Safe to re-run.
--- Existing database? Run migrations/001_hard_delete.sql, 002_admin_attendance_edit.sql and 003_attendance_locations.sql and 004_location_enable.sql once.
+-- Existing database? Run migrations 001 to 007 once (005 = login safety, 006 = Bill Book, 007 = bill delete requests). The server also creates the 005-007 tables by itself if you forget.
 
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
@@ -113,3 +113,68 @@ SELECT v.name, v.latitude, v.longitude, v.radius_m
        ) AS v(name, latitude, longitude, radius_m)
  WHERE NOT EXISTS (SELECT 1 FROM attendance_locations)
 ON CONFLICT DO NOTHING;
+
+
+-- ===== Login safety (migration 005) =====
+ALTER TABLE admins ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 0;
+ALTER TABLE admins ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE admins ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;
+
+-- Tokens that were logged out before they expired.
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    jti TEXT PRIMARY KEY,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS revoked_tokens_exp_idx ON revoked_tokens (expires_at);
+
+
+-- ===== Bill Book (migration 006) =====
+CREATE TABLE IF NOT EXISTS bills (
+    id SERIAL PRIMARY KEY,
+    payer_name TEXT NOT NULL,
+    amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+    bill_date DATE NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CLEARED')),
+    cleared_on DATE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bills_status_idx ON bills (status, bill_date DESC);
+
+CREATE TABLE IF NOT EXISTS bill_images (
+    id SERIAL PRIMARY KEY,
+    bill_id INT NOT NULL REFERENCES bills (id) ON DELETE CASCADE,
+    mime TEXT NOT NULL CHECK (mime IN ('image/jpeg', 'image/png', 'image/webp')),
+    storage_path TEXT, -- file lives in the private Supabase bucket
+    size_bytes INT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bill_images_bill_idx ON bill_images (bill_id);
+
+
+-- ===== Bill delete requests (migration 007) =====
+-- Anyone can ask for a bill to be deleted; an admin approves or rejects. The bill's details are
+-- copied into the request (snap_*) so the history survives after the bill is deleted.
+CREATE TABLE IF NOT EXISTS bill_delete_requests (
+    id SERIAL PRIMARY KEY,
+    bill_id INT REFERENCES bills (id) ON DELETE SET NULL,
+    requester_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at TIMESTAMPTZ,
+    decided_by TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    snap_payer TEXT NOT NULL,
+    snap_amount NUMERIC(12,2) NOT NULL,
+    snap_bill_date DATE NOT NULL,
+    snap_title TEXT NOT NULL DEFAULT '',
+    snap_note TEXT NOT NULL DEFAULT '',
+    snap_status TEXT NOT NULL,
+    snap_cleared_on DATE,
+    snap_photo_count INT NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS bill_delete_one_pending ON bill_delete_requests (bill_id) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS bill_delete_requests_status_idx ON bill_delete_requests (status, requested_at DESC);

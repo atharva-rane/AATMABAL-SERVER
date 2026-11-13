@@ -5,11 +5,16 @@ import { requireEnv } from './env';
 // *pooled* connection string (host contains "-pooler") to avoid running out of connections.
 const poolSize = Number(process.env.DB_POOL_MAX) || (process.env.VERCEL ? 3 : 10);
 
+const connectionString = requireEnv('NEON_DATABASE_URL');
+
+// A Postgres running on your own computer usually has no TLS; every hosted database (Neon, etc.) does.
+const isLocalDatabase = /@(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(connectionString);
+
 export const pool = new Pool({
-  connectionString: requireEnv('NEON_DATABASE_URL'),
+  connectionString,
   max: poolSize,
   idleTimeoutMillis: 30_000,
-  ssl: { rejectUnauthorized: true },
+  ssl: isLocalDatabase ? false : { rejectUnauthorized: true },
 });
 
 // An idle client erroring must not crash the process.
@@ -95,4 +100,105 @@ export function ensureLocationSchema(): Promise<void> {
     throw err;
   });
   return locationSchema;
+}
+
+
+let securitySchema: Promise<void> | null = null;
+
+/**
+ * Login-safety columns and the list of logged-out tokens (same as migrations/005).
+ * Safe to repeat; runs at most once per server process.
+ */
+export function ensureSecuritySchema(): Promise<void> {
+  securitySchema ??= (async () => {
+    await pool.query('ALTER TABLE admins ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 0');
+    await pool.query('ALTER TABLE admins ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0');
+    await pool.query('ALTER TABLE admins ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS revoked_tokens (
+        jti TEXT PRIMARY KEY,
+        expires_at TIMESTAMPTZ NOT NULL
+      )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS revoked_tokens_exp_idx ON revoked_tokens (expires_at)');
+  })().catch((err) => {
+    securitySchema = null; // retry on the next request
+    throw err;
+  });
+  return securitySchema;
+}
+
+// Anyone can ask for a bill to be deleted; an admin decides. The bill's details are copied into the
+// request (snap_*) so the record survives after the bill itself is gone.
+const DELETE_REQUESTS_SQL = `
+  CREATE TABLE IF NOT EXISTS bill_delete_requests (
+    id SERIAL PRIMARY KEY,
+    bill_id INT REFERENCES bills (id) ON DELETE SET NULL,
+    requester_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at TIMESTAMPTZ,
+    decided_by TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    snap_payer TEXT NOT NULL,
+    snap_amount NUMERIC(12,2) NOT NULL,
+    snap_bill_date DATE NOT NULL,
+    snap_title TEXT NOT NULL DEFAULT '',
+    snap_note TEXT NOT NULL DEFAULT '',
+    snap_status TEXT NOT NULL,
+    snap_cleared_on DATE,
+    snap_photo_count INT NOT NULL DEFAULT 0
+  )`;
+
+let billSchema: Promise<void> | null = null;
+
+/**
+ * Creates the Bill Book tables (same as migrations/006). Safe to repeat; runs at most once
+ * per server process, so the admin never has to apply it by hand.
+ */
+export function ensureBillSchema(): Promise<void> {
+  billSchema ??= (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bills (
+        id SERIAL PRIMARY KEY,
+        payer_name TEXT NOT NULL,
+        amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+        bill_date DATE NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CLEARED')),
+        cleared_on DATE,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        updated_at TIMESTAMPTZ DEFAULT now()
+      )`);
+    await pool.query('CREATE INDEX IF NOT EXISTS bills_status_idx ON bills (status, bill_date DESC)');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bill_images (
+        id SERIAL PRIMARY KEY,
+        bill_id INT NOT NULL REFERENCES bills (id) ON DELETE CASCADE,
+        mime TEXT NOT NULL CHECK (mime IN ('image/jpeg', 'image/png', 'image/webp')),
+        storage_path TEXT,
+        size_bytes INT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT now()
+      )`);
+    // Databases created by the first Bill Book version kept photos inside Postgres (column "data").
+    // Those photos keep working; new photos go to Supabase Storage.
+    await pool.query('ALTER TABLE bill_images ADD COLUMN IF NOT EXISTS storage_path TEXT');
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'bill_images' AND column_name = 'data') THEN
+          ALTER TABLE bill_images ALTER COLUMN data DROP NOT NULL;
+        END IF;
+      END $$;`)
+    await pool.query('CREATE INDEX IF NOT EXISTS bill_images_bill_idx ON bill_images (bill_id)');
+    await pool.query(DELETE_REQUESTS_SQL);
+    await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS bill_delete_one_pending ON bill_delete_requests (bill_id) WHERE status = \'PENDING\'');
+    await pool.query('CREATE INDEX IF NOT EXISTS bill_delete_requests_status_idx ON bill_delete_requests (status, requested_at DESC)');
+  })().catch((err) => {
+    billSchema = null; // retry on the next request
+    throw err;
+  });
+  return billSchema;
 }

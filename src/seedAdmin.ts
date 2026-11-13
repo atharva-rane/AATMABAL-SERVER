@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
-import { pool } from './db';
+import { ensureSecuritySchema, pool } from './db';
 
-const MIN_PASSWORD_LENGTH = 10;
+const MIN_PASSWORD_LENGTH = 12;
 
 async function main(): Promise<void> {
   const [username, password] = process.argv.slice(2);
@@ -12,16 +12,24 @@ async function main(): Promise<void> {
     return;
   }
 
+  await ensureSecuritySchema();
+
   const hash = await bcrypt.hash(password, 12);
 
+  // Saving a password also logs this admin out everywhere (token_version) and lifts any login pause,
+  // so re-running this command is the "I forgot my password / my phone was stolen" fix.
   await pool.query(
     `INSERT INTO admins (username, password_hash)
      VALUES ($1, $2)
-     ON CONFLICT (username) DO UPDATE SET password_hash = $2`,
+     ON CONFLICT (username) DO UPDATE
+        SET password_hash = $2,
+            token_version = admins.token_version + 1,
+            failed_attempts = 0,
+            locked_until = NULL`,
     [username, hash],
   );
 
-  console.log(`Admin "${username}" saved.`);
+  console.log(`Admin "${username}" saved. Any older logins for this admin have been signed out.`);
 }
 
 main()
